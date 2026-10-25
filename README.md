@@ -104,7 +104,7 @@ webhook 和 `redact-values` 会从通知内容中移除。为避免全局日志�
 - Fork PR 无法取得 Secret 时自动跳过，不需要提高工作流权限。
 - 支持飞书 `/open-apis/bot/v2/hook/` 自定义机器人，以数字型 `code: 0` 判定成功；不承诺兼容旧版响应或代理改写的响应格式。机器人需要使用 HTTPS webhook；不支持签名校验。关键词或 IP 白名单设置仍需与实际发送内容及 Runner 网络匹配。为避免外发内容被转交到其他地址，不跟随 webhook 重定向。
 - `log-file` 可以读取指定的绝对路径及符号链接目标，`webhook` 决定发送目的地。二者必须来自维护者控制的可信配置，不要直接透传不可信的 `inputs.*`、`github.event.*` 等值；此 Action 不提供文件系统隔离。
-- 支持 GitHub 托管的 Linux、Windows、macOS Runner，Windows 示例也需显式使用 Bash。自托管 Runner 需支持 Node.js 24 Action。
+- 仅支持 Linux、macOS Runner，不支持 Windows。自托管 Runner 需支持 Node.js 24 Action。
 - 仓库访问权限由 GitHub 决定，调用方需要有权引用此 Action；配置 Secret 并不会授予 Action 仓库的访问权限。
 
 ## 发布
@@ -125,7 +125,7 @@ pnpm release
 
 推送失败时，本地具体版本新标签会保留，本地浮动标签不提前移动。脚本会区分并发/分支冲突、服务端不支持原子推送及连接异常；仅对明确的连接异常提供带原 lease 的条件式重试命令。冲突应先 fetch 并核对分支、版本，服务端不支持原子推送时不会自动降级。再次直接执行 `pnpm release` 会因本地具体版本标签已存在而报错。解决原因后，如需重发同一版本，先确认远端未发布该版本，再用 `git tag -d vX.Y.Z` 删除对应的本地标签；远端已发布时应提升 `package.json.version`。
 
-本地 Git 命令超时为 30 秒，远端查询和推送为 5 分钟。推送超时意味着远端状态未知，服务端可能已完成发布；务必先按提示核对远端引用，不要直接重试或删除标签。错误提示中的核对、重试和恢复命令采用 POSIX shell（如 sh、bash、zsh）的引号语法；在 PowerShell/cmd 中需按对应语法调整。脚本不自动重试推送，也不交互式询问 HTTP 凭据；默认 SSH 使用 BatchMode，尊重显式设置的 SSH 客户端。发布前请配置好凭据助手或 SSH，避免在 remote URL 中内嵌用户名/token；脚本会遮盖错误诊断中的 URL 用户信息。
+本地 Git 命令超时为 30 秒，远端查询和推送为 5 分钟。推送超时意味着远端状态未知，服务端可能已完成发布；务必先按提示核对远端引用，不要直接重试或删除标签。发布脚本仅支持 Linux、macOS，错误提示中的核对、重试和恢复命令采用 POSIX shell（如 sh、bash、zsh）的引号语法。脚本不自动重试推送，也不交互式询问 HTTP 凭据；默认 SSH 使用 BatchMode，尊重显式设置的 SSH 客户端。发布前请配置好凭据助手或 SSH，避免在 remote URL 中内嵌用户名/token；脚本会遮盖错误诊断中的 URL 用户信息。
 
 ## 开发与验证
 
@@ -139,4 +139,4 @@ npm run check
 
 测试与被测试文件放在同一目录：`src/index.mjs` 对应 `src/index.test.mjs`。
 
-测试通过模拟 HTTP 请求验证卡片、步骤过滤、脱敏、日志降级及发送失败行为，不会向真实飞书群发消息。仓库 CI 在 Linux、Windows、macOS 上使用 Node.js 24 执行检查，Job 超时为 10 分钟。接线测试使用仅用于 CI 的 fetch 模拟器验证真实 Action 入口、输入和输出，并明确断言发送状态，不访问网络。
+测试通过模拟 HTTP 请求验证卡片、步骤过滤、脱敏、日志降级及发送失败行为，不会向真实飞书群发消息。仓库 CI 仅在 Linux（`ubuntu-24.04`）和 macOS（`macos-latest`）上使用 Node.js 24 执行检查，不包含 Windows 验收，Job 超时为 10 分钟。接线测试使用仅用于 CI 的 fetch 模拟器验证真实 Action 入口、输入和输出，并明确断言发送状态，不访问网络。
