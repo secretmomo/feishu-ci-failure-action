@@ -1,0 +1,16 @@
+{
+  "name": "feishu-ci-failure-action",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "A GitHub Action that sends CI check failure notifications to Feishu.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test",
+    "check": "node --check src/index.mjs && node --test",
+    "release": "node scripts/release.mjs"
+  }
+}

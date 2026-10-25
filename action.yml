@@ -1,0 +1,31 @@
+name: Feishu CI Failure
+description: Notify Feishu when a selected CI check fails, with redacted error logs and workflow details.
+author: secret-momo
+branding:
+  icon: alert-circle
+  color: red
+inputs:
+  webhook:
+    description: Feishu custom bot webhook URL. Skip notification when empty.
+    required: false
+  outcome:
+    description: Outcome of the watched step. Takes precedence over steps.
+    required: false
+  steps:
+    description: Optional legacy JSON steps context, passed with toJSON(steps). Prefer outcome.
+    required: false
+  check-step:
+    description: Step ID shown on the card; selects the watched step when steps is used.
+    default: check
+  log-file:
+    description: Optional UTF-8 check log path, absolute or relative to the workspace.
+    required: false
+  redact-values:
+    description: Optional secret values to redact, one per line. The webhook is always redacted.
+    required: false
+outputs:
+  status:
+    description: Notification result (sent, skipped, or warning).
+runs:
+  using: node24
+  main: src/index.mjs

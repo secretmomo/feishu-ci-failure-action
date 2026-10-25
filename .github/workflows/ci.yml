@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - id: check
+        shell: bash
+        run: npm run check 2>&1 | tee "$RUNNER_TEMP/ci-check.log"
+      - name: 验证 Action 入口（缺少 webhook 时跳过）
+        id: smoke_skip
+        uses: ./
+        with:
+          outcome: ${{ steps.check.outcome }}
+      - name: 准备接线测试日志
+        shell: bash
+        run: |
+          node -e 'require("node:fs").writeFileSync(process.env.RUNNER_TEMP + "/smoke.log", "smoke failure: private-smoke-token")'
+      - name: 验证 Action 接线（模拟飞书，不访问网络）
+        id: smoke_send
+        uses: ./
+        env:
+          NODE_OPTIONS: --import=./.github/scripts/mock-feishu.mjs
+        with:
+          webhook: https://ci.invalid/hook
+          outcome: failure
+          steps: invalid
+          check-step: smoke-check
+          log-file: ${{ runner.temp }}/smoke.log
+          redact-values: private-smoke-token
+      - name: 断言接线测试结果
+        shell: bash
+        env:
+          SKIP_STATUS: ${{ steps.smoke_skip.outputs.status }}
+          SEND_STATUS: ${{ steps.smoke_send.outputs.status }}
+        run: |
+          node -e 'const assert = require("node:assert/strict"); assert.equal(process.env.SKIP_STATUS, "skipped"); assert.equal(process.env.SEND_STATUS, "sent")'
+      - name: 通知飞书 CI 失败
+        if: ${{ failure() && steps.check.outcome == 'failure' }}
+        uses: ./
+        with:
+          webhook: ${{ secrets.FEISHU_CI_FAILURE_WEBHOOK }}
+          outcome: ${{ steps.check.outcome }}
+          log-file: ${{ runner.temp }}/ci-check.log
