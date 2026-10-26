@@ -2,15 +2,36 @@ import { constants, realpathSync } from 'node:fs';
 import { appendFile, open } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { stripVTControlCharacters } from 'node:util';
+import { parseEnv, stripVTControlCharacters } from 'node:util';
 
 const FALLBACK_REASON = '未提供可用的检查日志，请查看 CI 运行详情。';
 const LOG_WINDOW_BYTES = 64 * 1024;
 const LOG_WINDOW_MAX_BYTES = 1024 * 1024;
+const ENV_FILE_MAX_BYTES = 1024 * 1024;
 
 class DiagnosticError extends Error {}
 
-export async function readLogWindow(path, _encoding = 'utf8', openFile = open, allowCR = true) {
+export async function readEnvFile(path, _encoding = 'utf8', openFile = open) {
+  const file = await openFile(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.size > ENV_FILE_MAX_BYTES) throw new Error();
+    // One extra byte detects growth without allowing an unbounded readFile.
+    const bytes = Buffer.alloc(stat.size + 1);
+    let total = 0;
+    while (total < bytes.length) {
+      const { bytesRead } = await file.read(bytes, total, bytes.length - total, total);
+      if (!bytesRead) break;
+      total += bytesRead;
+    }
+    if (total !== stat.size) throw new Error();
+    return bytes.subarray(0, total).toString('utf8');
+  } finally {
+    await file.close();
+  }
+}
+
+export async function readLogWindow(path, _encoding = 'utf8', openFile = open, allowCR = true, secrets = []) {
   // Opening first avoids a stat/open race. O_NONBLOCK prevents a FIFO without
   // a writer from hanging before fstat can reject it; Windows may omit the flag.
   const file = await openFile(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
@@ -21,6 +42,7 @@ export async function readLogWindow(path, _encoding = 'utf8', openFile = open, a
     let size = Math.min(stat.size, LOG_WINDOW_BYTES + 1);
     let start = stat.size;
     let bytes = Buffer.alloc(0);
+    const prepared = stat.size > size ? prepareWindowSecrets(secrets) : [];
     for (;;) {
       const nextStart = stat.size - size;
       // Only read the new prefix when expanding, keeping total I/O <= 1 MiB.
@@ -47,7 +69,8 @@ export async function readLogWindow(path, _encoding = 'utf8', openFile = open, a
         const after = atLineStart
           ? (context === 13 && window[0] === 10 ? 1 : 0)
           : newline + (window[newline] === 13 && window[newline + 1] === 10 ? 2 : 1);
-        const completeLines = window.subarray(after).toString('utf8');
+        let completeLines = window.subarray(after).toString('utf8');
+        if (prepared.length) completeLines = sanitizeWindowStart(completeLines, prepared);
         if (completeLines.trim()) return completeLines;
       }
       if (size >= LOG_WINDOW_MAX_BYTES) {
@@ -71,8 +94,8 @@ function commandData(value) {
   return value.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
 }
 
-function secretValues(webhook, extra) {
-  return [...new Set([webhook, ...extra.split(/\r?\n/)].filter((value) => value.trim()))]
+function secretValues(webhook, extra, fileValues = []) {
+  return [...new Set([webhook, ...extra.split(/\r?\n/), ...fileValues].filter((value) => value.trim()))]
     .sort((a, b) => b.length - a.length);
 }
 
@@ -81,17 +104,46 @@ export function redact(text, secrets) {
   return text;
 }
 
-function redactControlSeparated(text, secrets) {
+function prefixFailure(pattern) {
+  const failure = new Uint32Array(pattern.length);
+  for (let i = 1, matched = 0; i < pattern.length; i++) {
+    while (matched && pattern[i] !== pattern[matched]) matched = failure[matched - 1];
+    if (pattern[i] === pattern[matched]) matched++;
+    failure[i] = matched;
+  }
+  return failure;
+}
+
+function redactControlSeparated(text, secrets, { leadingEnd = 0, allMatches = false } = {}) {
   const controls = /[\u0000-\u001f\u007f-\u009f]/g;
   const compact = text.replace(controls, '');
-  if (compact === text) return text;
+  if (compact === text && !allMatches && !leadingEnd) return text;
   let ends;
+  if (leadingEnd) {
+    ends = new Uint32Array(compact.length);
+    ends[0] = leadingEnd;
+  }
   for (const secret of secrets) {
     const needle = secret.replace(controls, '');
     if (!needle) continue;
     let start = compact.indexOf(needle);
     if (start < 0) continue;
     ends ??= new Uint32Array(compact.length);
+    if (allMatches) {
+      // Find every overlapping occurrence in linear time, including periodic
+      // values. Repeated indexOf(..., start + 1) re-compares whole long needles.
+      const failure = prefixFailure(needle);
+      for (let i = start, matched = 0; i < compact.length; i++) {
+        while (matched && compact[i] !== needle[matched]) matched = failure[matched - 1];
+        if (compact[i] === needle[matched]) matched++;
+        if (matched === needle.length) {
+          const at = i + 1 - needle.length;
+          ends[at] = Math.max(ends[at], i + 1);
+          matched = failure[matched - 1];
+        }
+      }
+      continue;
+    }
     while (start >= 0) {
       ends[start] = Math.max(ends[start], start + needle.length);
       start = compact.indexOf(needle, start + needle.length);
@@ -119,15 +171,59 @@ function redactControlSeparated(text, secrets) {
   return parts.join('');
 }
 
+function normalizeControls(text) {
+  return text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '')
+    .replace(/\r\n?/g, '\n');
+}
+
 function sanitizeText(text, secrets) {
   // Preserve exact matches, including secrets containing literal CR, before
   // changing their representation. Then handle control-separated matches.
   let cleaned = redact(text, secrets);
   cleaned = redact(stripVTControlCharacters(cleaned), secrets);
   cleaned = redactControlSeparated(cleaned, secrets);
-  cleaned = cleaned.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, '');
-  cleaned = cleaned.replace(/\r\n?/g, '\n');
-  return redact(cleaned, secrets);
+  return redact(normalizeControls(cleaned), secrets);
+}
+
+function prepareWindowSecrets(secrets) {
+  const controls = /[\u0000-\u001f\u007f-\u009f]/g;
+  // Normalize each value once per read, retaining LF-aligned suffix offsets in
+  // compact coordinates. Expansion reuses this data instead of slicing values.
+  return secrets.map((secret) => {
+    const cleaned = stripVTControlCharacters(secret);
+    const lineStarts = new Set();
+    let offset = 0;
+    for (let i = 0; i < cleaned.length; i++) {
+      const code = cleaned.charCodeAt(i);
+      if (code === 10) lineStarts.add(offset);
+      if (code > 31 && (code < 127 || code > 159)) offset++;
+    }
+    return { compact: cleaned.replace(controls, ''), lineStarts };
+  });
+}
+
+function sanitizeWindowStart(text, prepared) {
+  // All matching happens before replacement so overlapping complete values
+  // cannot destroy a suffix match or be cut by hiding a shorter suffix first.
+  const cleaned = stripVTControlCharacters(text);
+  const compact = cleaned.replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
+  // KMP: build the window prefix failure table once, then scan each compact
+  // value once. At its end, follow borders to the longest LF-aligned suffix.
+  const failure = prefixFailure(compact);
+  let leadingEnd = 0;
+  for (const { compact: secret, lineStarts } of prepared) {
+    if (!compact.length || !lineStarts.size) continue;
+    let matched = 0;
+    for (let i = 0; i < secret.length; i++) {
+      while (matched && (matched === compact.length || secret[i] !== compact[matched])) matched = failure[matched - 1];
+      if (secret[i] === compact[matched]) matched++;
+    }
+    while (matched && !lineStarts.has(secret.length - matched)) matched = failure[matched - 1];
+    leadingEnd = Math.max(leadingEnd, matched);
+  }
+  // Reuse the existing span merger and compact-to-text mapping. Include all
+  // full matches in the same union, even when they extend beyond the suffix.
+  return normalizeControls(redactControlSeparated(cleaned, prepared.map((value) => value.compact), { leadingEnd, allMatches: true }));
 }
 
 function redactCardText(value, secrets) {
@@ -152,10 +248,11 @@ export async function logTail(path, secrets, read = readLogWindow) {
   if (!path) return sanitizeText(FALLBACK_REASON, secrets);
   try {
     // Redact before truncating so a secret straddling the cutoff cannot leak.
-    // A configured literal-CR secret can cross a CR boundary. In that rare case
-    // only LF is a safe read boundary, retaining the existing secrecy guarantee.
+    // CR and multiline secrets require LF boundaries; guard the leading records
+    // against multiline secrets beginning before the bounded read window.
     const raw = read === readLogWindow
-      ? await readLogWindow(path, 'utf8', open, !secrets.some((value) => value.includes('\r')))
+      ? await readLogWindow(path, 'utf8', open, !secrets.some((value) => /[\r\n]/.test(value)),
+        secrets.some((value) => value.includes('\n')) ? secrets : [])
       : await read(path, 'utf8');
     const log = sanitizeText(raw, secrets);
     let tail = log.trim().split(/\r?\n/).slice(-25).join('\n');
@@ -209,9 +306,9 @@ export function buildNotification(env, checkStep, reason, secrets = []) {
   }, secrets);
 }
 
-export async function run({ env = process.env, post = fetch, read = readLogWindow, log = console.log } = {}) {
+export async function run({ env = process.env, post = fetch, read = readLogWindow, readEnv = readEnvFile, log = console.log } = {}) {
   const webhook = (env.INPUT_WEBHOOK || '').trim();
-  const secrets = secretValues(webhook, env['INPUT_REDACT-VALUES'] || '');
+  let secrets = secretValues(webhook, env['INPUT_REDACT-VALUES'] || '');
   const maskValues = secrets.filter((value) => value.trim().length >= 4);
   for (const value of maskValues) log(`::add-mask::${commandData(value)}`);
   const warning = (message) => log(`::warning::${commandData(redact(message, secrets))}`);
@@ -243,18 +340,38 @@ export async function run({ env = process.env, post = fetch, read = readLogWindo
       log('目标检查步骤未失败，跳过飞书通知。');
       return 'skipped';
     }
-    if (maskValues.length < secrets.length) {
-      warning(`有 ${secrets.length - maskValues.length} 个过短的脱敏值未注册为全局掩码，仍会从通知内容中隐藏。`);
-    }
-
     let url;
     try { url = new URL(webhook); } catch { throw new DiagnosticError('webhook 必须是有效的 HTTPS URL。'); }
     if (url.protocol !== 'https:' || url.username || url.password) {
       throw new DiagnosticError('webhook 必须是有效的 HTTPS URL，且不能包含用户凭据。');
     }
+    let configWarning = false;
+    const envFile = (env['INPUT_REDACT-ENV-FILE'] || '').trim();
+    if (envFile) {
+      try {
+        // Only read the explicitly configured, maintainer-trusted path. Keep
+        // parsed values as array entries so multiline secrets remain intact.
+        const values = Object.values(parseEnv(await readEnv(resolve(env.GITHUB_WORKSPACE || process.cwd(), envFile), 'utf8')));
+        if (!values.length) throw new Error();
+        const previous = new Set(secrets);
+        secrets = secretValues(webhook, env['INPUT_REDACT-VALUES'] || '', values.filter((value) => value.length >= 8));
+        for (const value of secrets) {
+          if (!previous.has(value) && value.trim().length >= 4) log(`::add-mask::${commandData(value)}`);
+        }
+      } catch {
+        // Neither paths nor parser/filesystem exceptions are safe diagnostics.
+        // Without the configured secrets we must not read or send check logs.
+        configWarning = true;
+        warning('无法安全加载 redact-env-file，已省略检查日志。');
+      }
+    }
+    const shortValues = secrets.filter((value) => value.trim().length < 4).length;
+    if (shortValues) {
+      warning(`有 ${shortValues} 个过短的脱敏值未注册为全局掩码，仍会从通知内容中隐藏。`);
+    }
     const logFile = (env['INPUT_LOG-FILE'] || '').trim();
     const logPath = logFile ? resolve(env.GITHUB_WORKSPACE || process.cwd(), logFile) : '';
-    const reason = await logTail(logPath, secrets, read);
+    const reason = configWarning ? sanitizeText(FALLBACK_REASON, secrets) : await logTail(logPath, secrets, read);
     const card = buildNotification(env, checkStep, reason, secrets);
     // Redact metadata too. Never print the payload or a raw network/API error.
     const body = JSON.stringify({ msg_type: 'interactive', card });
@@ -275,7 +392,7 @@ export async function run({ env = process.env, post = fetch, read = readLogWindo
     try { result = await response.json(); } catch { throw new DiagnosticError('飞书返回了无效的 JSON 响应。'); }
     if (result?.code !== 0) throw new DiagnosticError('飞书拒绝消息，请检查机器人 webhook 及安全设置。');
     log('飞书 CI 失败通知已发送。');
-    return 'sent';
+    return configWarning ? 'warning' : 'sent';
   } catch (error) {
     if (error instanceof DiagnosticError) {
       warning(error.message);

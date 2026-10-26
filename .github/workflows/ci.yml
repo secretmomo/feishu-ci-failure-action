@@ -36,7 +36,7 @@ jobs:
       - name: 准备接线测试日志
         shell: bash
         run: |
-          node -e 'require("node:fs").writeFileSync(process.env.RUNNER_TEMP + "/smoke.log", "smoke failure: private-smoke-token")'
+          node -e 'const fs = require("node:fs"); fs.writeFileSync(process.env.RUNNER_TEMP + "/smoke.log", "smoke failure: private-smoke-token"); fs.writeFileSync(process.env.RUNNER_TEMP + "/smoke.env", "TOKEN=private-smoke-token")'
       - name: 验证 Action 接线（模拟飞书，不访问网络）
         id: smoke_send
         uses: ./
@@ -48,7 +48,7 @@ jobs:
           steps: invalid
           check-step: smoke-check
           log-file: ${{ runner.temp }}/smoke.log
-          redact-values: private-smoke-token
+          redact-env-file: ${{ runner.temp }}/smoke.env
       - name: 断言接线测试结果
         shell: bash
         env:

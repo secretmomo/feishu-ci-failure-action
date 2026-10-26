@@ -4,7 +4,7 @@ import { mkdtemp, open, readFile, rm, symlink, writeFile } from 'node:fs/promise
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { buildNotification, logTail, readLogWindow, run } from './index.mjs';
+import { buildNotification, logTail, readEnvFile, readLogWindow, run } from './index.mjs';
 
 const webhook = 'https://open.feishu.cn/open-apis/bot/v2/hook/example-token';
 const base = {
@@ -643,17 +643,19 @@ test('metadata-driven action entry validates wiring and successful payload with 
   const main = metadata.match(/^  main: (.+)$/m)?.[1];
   assert.equal(main, 'src/index.mjs');
   assert.match(metadata, /using: node24/);
-  for (const input of ['outcome', 'steps', 'check-step', 'log-file', 'redact-values']) {
+  for (const input of ['outcome', 'steps', 'check-step', 'log-file', 'redact-values', 'redact-env-file']) {
     assert.ok(metadata.includes(`  ${input}:\n`));
   }
   const logFile = join(dir, 'log');
   const outputFile = join(dir, 'output');
   await writeFile(logFile, 'smoke failure: private-smoke-token');
+  await writeFile(join(dir, '.env'), 'TOKEN=private-smoke-token');
   const child = spawnSync(process.execPath, [main], {
     cwd: resolve(import.meta.dirname, '..'),
     env: {
       ...process.env, INPUT_WEBHOOK: 'https://ci.invalid/hook', INPUT_OUTCOME: 'failure', INPUT_STEPS: 'invalid',
-      'INPUT_CHECK-STEP': 'smoke-check', 'INPUT_LOG-FILE': logFile, 'INPUT_REDACT-VALUES': 'private-smoke-token',
+      'INPUT_CHECK-STEP': 'smoke-check', 'INPUT_LOG-FILE': logFile, 'INPUT_REDACT-VALUES': '',
+      'INPUT_REDACT-ENV-FILE': '.env', GITHUB_WORKSPACE: dir,
       GITHUB_OUTPUT: outputFile,
       NODE_OPTIONS: '--import=./.github/scripts/mock-feishu.mjs',
     },
@@ -663,4 +665,421 @@ test('metadata-driven action entry validates wiring and successful payload with 
   assert.equal(child.stderr, '');
   assert.match(child.stdout, /通知已发送/);
   assert.equal(await readFile(outputFile, 'utf8'), 'status=sent\n');
+});
+
+const envFileWarning = '::warning::无法安全加载 redact-env-file，已省略检查日志。';
+
+test('unconfigured env input never reads configuration or auto-redacts workspace .env', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-env-opt-in-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, '.env'), 'TOKEN=unconfigured-token');
+  const result = await invoke({ GITHUB_WORKSPACE: dir, 'INPUT_LOG-FILE': 'log' }, {
+    readEnv: () => assert.fail('must not read configuration'),
+    read: async () => 'unconfigured-token',
+  });
+  assert.equal(result.status, 'sent');
+  assert.match(result.requests[0].body, /unconfigured-token/);
+});
+
+for (const [label, workspace, file, expected] of [
+  ['workspace relative', '/workspace/project', 'config/.env', '/workspace/project/config/.env'],
+  ['absolute', '/workspace/project', '/trusted/.env', '/trusted/.env'],
+  ['cwd fallback', '', 'config/.env', resolve('config/.env')],
+]) {
+  test(`env file resolves ${label}`, async () => {
+    const paths = [];
+    const result = await invoke({ GITHUB_WORKSPACE: workspace, 'INPUT_REDACT-ENV-FILE': file, 'INPUT_LOG-FILE': 'log' }, {
+      readEnv: async (path, encoding) => { paths.push(path); assert.equal(encoding, 'utf8'); return 'TOKEN=path-secret-value'; },
+      read: async () => 'path-secret-value',
+    });
+    assert.deepEqual(paths, [expected]);
+    assert.equal(result.status, 'sent');
+    assert.ok(!result.requests[0].body.includes('path-secret-value'));
+  });
+}
+
+test('real env file follows Node semantics and preserves multiline values as one secret', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-env-syntax-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, '.env'), [
+    '# comment', 'export TOKEN = unquoted-token # ignored', 'SINGLE=\'single # token\'',
+    'DOUBLE="double # token" # ignored', 'MULTI="multi\r\nline-secret"',
+    'SHORT=1234567', 'EIGHT=12345678', 'PORT=3000', 'EMPTY=',
+  ].join('\r\n'));
+  await writeFile(join(dir, 'log'), 'unquoted-token single # token double # token multi\nline-secret 1234567 12345678 3000\nstandalone multi and line-secret');
+  const result = await invoke({ GITHUB_WORKSPACE: dir, 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' });
+  assert.equal(result.status, 'sent');
+  const reason = result.requests[0].payload.card.body.elements[1].content;
+  assert.ok(reason.includes('[已隐藏] [已隐藏] [已隐藏] [已隐藏] 1234567 [已隐藏] 3000'));
+  assert.ok(reason.includes('standalone multi and line-secret'));
+  assert.ok(result.logs.includes('::add-mask::multi%0Aline-secret'));
+});
+
+test('file values merge and deduplicate with explicit values and webhook without changing short explicit values', async () => {
+  const result = await invoke({ 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_REDACT-VALUES': 'shared-token\nxy', 'INPUT_LOG-FILE': 'log', GITHUB_WORKFLOW: 'file-only-token' }, {
+    readEnv: async () => `HOOK=${webhook}\nA=shared-token\nB=shared-token\nC=file-only-token\nSHORT=1234567`,
+    read: async () => `${webhook} shared-token file-only-token xy 1234567`,
+  });
+  assert.equal(result.status, 'sent');
+  const masks = result.logs.filter((line) => line.startsWith('::add-mask::'));
+  assert.equal(masks.length, 3);
+  assert.equal(masks.filter((line) => line === '::add-mask::shared-token').length, 1);
+  assert.ok(!result.requests[0].body.includes('file-only-token'));
+  assert.match(result.requests[0].body, /1234567/);
+  assert.ok(!result.requests[0].body.includes(' xy '));
+});
+
+test('env secrets split by terminal controls and crossing display cutoffs stay hidden', async () => {
+  const secret = 'boundary-private-token';
+  for (const raw of [
+    'boundary-\u001b[31mprivate\u0000-\tto\rken\u001b[0m',
+    'x'.repeat(100) + secret + 'y'.repeat(2795),
+    'x'.repeat(30) + 'boundary-\nprivate-token\n' + 'safe\n'.repeat(24),
+  ]) {
+    const result = await invoke({ 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' }, {
+      readEnv: async () => `TOKEN=${secret}`, read: async () => raw,
+    });
+    const reason = result.requests[0].payload.card.body.elements[1].content;
+    assert.ok(!/boundary|private|token/.test(reason), reason);
+  }
+});
+
+for (const [label, readEnv] of [
+  ['missing', async () => { const error = new Error('ENOENT private-config-token'); error.code = 'ENOENT'; throw error; }],
+  ['unreadable', async () => { throw new Error('EACCES private-config-token'); }],
+  ['empty', async () => ''],
+  ['comments only', async () => '# private-config-token\n\n'],
+  ['no parseable entries', async () => 'private-config-token'],
+]) {
+  test(`env ${label} warns and sends a card without reading or including raw logs`, async () => {
+    let logReads = 0;
+    const result = await invoke({ 'INPUT_REDACT-ENV-FILE': 'private-config-token', 'INPUT_LOG-FILE': 'log' }, {
+      readEnv, read: async () => { logReads++; return 'unsafe-original-log'; },
+    });
+    assert.equal(logReads, 0);
+    assert.equal(result.status, 'warning');
+    assert.equal(result.requests.length, 1);
+    assert.ok(result.logs.includes(envFileWarning));
+    assert.ok(!result.logs.filter((line) => !line.startsWith('::add-mask::')).join('\n').includes('private-config-token'));
+    assert.ok(!result.requests[0].body.includes('private-config-token'));
+    assert.match(result.requests[0].body, /未提供可用的检查日志/);
+  });
+}
+
+test('a parsed file with only short or empty values is valid', async () => {
+  const result = await invoke({ 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' }, {
+    readEnv: async () => 'PORT=3000\nEMPTY=', read: async () => 'PORT 3000',
+  });
+  assert.equal(result.status, 'sent');
+  assert.match(result.requests[0].body, /PORT 3000/);
+});
+
+test('real missing file and directory read failures use the same safe fallback', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-env-failure-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const file of [join(dir, 'missing-private-token'), dir]) {
+    const result = await invoke({ 'INPUT_REDACT-ENV-FILE': file, 'INPUT_LOG-FILE': 'log' }, {
+      read: () => assert.fail('must not read logs'),
+    });
+    assert.equal(result.status, 'warning');
+    assert.equal(result.requests.length, 1);
+    assert.ok(result.logs.includes(envFileWarning));
+  }
+});
+
+for (const env of [
+  { INPUT_WEBHOOK: '' }, ...['success', 'cancelled', 'skipped', 'invalid'].map((INPUT_OUTCOME) => ({ INPUT_OUTCOME })),
+  { INPUT_WEBHOOK: 'http://invalid.example' },
+]) {
+  test(`does not read env when notification is unnecessary or invalid: ${JSON.stringify(env)}`, async () => {
+    let configReads = 0;
+    const result = await invoke({ ...env, 'INPUT_REDACT-ENV-FILE': '.env' }, {
+      readEnv: async () => { configReads++; return 'TOKEN=unnecessary-token'; },
+    });
+    assert.equal(configReads, 0);
+    assert.equal(result.requests.length, 0);
+  });
+}
+
+test('env masks escape commands, and log/network errors never expose exception contents', async () => {
+  const secret = 'private%\n::warning::injected';
+  for (const networkFailure of [false, true]) {
+    const result = await invoke({ 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' }, {
+      readEnv: async () => `TOKEN="${secret}"`,
+      read: async () => { throw new Error(secret); },
+      ...(networkFailure ? { post: async () => { throw new Error(secret); } } : {}),
+    });
+    assert.equal(result.status, networkFailure ? 'warning' : 'sent');
+    assert.ok(result.logs.includes('::add-mask::private%25%0A::warning::injected'));
+    assert.ok(!result.logs.filter((line) => !line.startsWith('::add-mask::')).join('\n').includes('injected'));
+    assert.ok(result.requests.every((request) => !request.body.includes('injected')));
+  }
+});
+
+test('multiline env secrets crossing a real read-window boundary cannot leak suffixes', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-env-window-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  await writeFile(join(dir, '.env'), 'TOKEN="multiline-prefix\nprivate-window-suffix"');
+  for (const prefix of ['prefix:multiline-prefix', 'prefix:multiline-prefix\n']) {
+    const record = (prefix.endsWith('\n') ? '' : '\n') + 'private-window-suffix\nERROR safe';
+    const tail = record + ' '.repeat(65536 - Buffer.byteLength(record));
+    await writeFile(join(dir, 'log'), prefix + tail);
+    const result = await invoke({ GITHUB_WORKSPACE: dir, 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' });
+    assert.equal(result.status, 'sent');
+    const reason = result.requests[0].payload.card.body.elements[1].content;
+    assert.ok(!reason.includes('private-window-suffix'), reason);
+    assert.ok(reason.includes('ERROR safe'));
+  }
+});
+
+for (const aligned of [true, false]) {
+  test(`review H-1: full multiline value at first complete window record stays hidden (aligned=${aligned})`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'feishu-review-h1-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const tail = '\nERROR safe';
+    const suffix = 'PRIVATE-KEY-TAIL-SHOULD-NOT-LEAK';
+    const length = 65536 - Buffer.byteLength(tail) - (aligned ? 0 : 10);
+    const secret = 'BEGIN-PRIVATE-KEY-' + 'k'.repeat(length - 'BEGIN-PRIVATE-KEY-'.length - 1 - suffix.length) + '\n' + suffix;
+    // Aligned: context byte is LF. Otherwise the window starts inside the
+    // preceding record, making the secret the first complete retained record.
+    await writeFile(join(dir, 'log'), 'x'.repeat(200000) + '\n' + secret + tail);
+    await writeFile(join(dir, '.env'), `TOKEN="${secret}"`);
+    const reason = await logTail(join(dir, 'log'), [secret]);
+    assert.ok(!reason.includes(suffix), reason);
+    assert.ok(reason.includes('ERROR safe'));
+    const result = await invoke({ GITHUB_WORKSPACE: dir, 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' });
+    assert.equal(result.status, 'sent');
+    assert.ok(!result.requests[0].body.includes(suffix));
+    assert.match(result.requests[0].body, /ERROR safe/);
+  });
+}
+
+test('review M-1: unused multiline secret does not discard safe logs or force expansion', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-m1-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const path = join(dir, 'log');
+  const secret = Array.from({ length: 40 }, (_, i) => `line-${i}-of-private-key`).join('\n');
+  await writeFile(path, ('z'.repeat(100 * 1024) + '\n').repeat(12) + 'REAL ERROR: safe-diagnostic\n');
+  const reason = await logTail(path, [secret]);
+  assert.equal(reason, 'REAL ERROR: safe-diagnostic');
+  let bytesRead = 0;
+  await readLogWindow(path, 'utf8', async (...args) => {
+    const file = await open(...args);
+    return {
+      stat: () => file.stat(), close: () => file.close(),
+      read: async (...args) => { const result = await file.read(...args); bytesRead += result.bytesRead; return result; },
+    };
+  }, false, [secret]);
+  assert.ok(bytesRead <= 65537);
+});
+
+test('review L-1: padded file values count toward the single short-mask reminder', async () => {
+  const result = await invoke({ 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_REDACT-VALUES': 'xy', 'INPUT_LOG-FILE': 'log' }, {
+    readEnv: async () => 'KEY="     abc"', read: async () => 'value=     abc xy',
+  });
+  const warnings = result.logs.filter((line) => line.startsWith('::warning::'));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /有 2 个过短/);
+  assert.ok(!result.logs.includes('::add-mask::     abc'));
+  assert.ok(!result.requests[0].body.includes('abc'));
+});
+
+test('review L-2: FIFO, devices and oversized configuration fail safely without hanging', { skip: process.platform === 'win32' }, async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-l2-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const fifo = join(dir, 'private-fifo.env');
+  const oversized = join(dir, 'oversized.env');
+  assert.equal(spawnSync('mkfifo', [fifo]).status, 0);
+  await writeFile(oversized, 'TOKEN=' + 'x'.repeat(1024 * 1024));
+  // Subprocess timeout prevents an unsafe implementation from hanging tests.
+  for (const path of [fifo, '/dev/zero', oversized]) {
+    const output = join(dir, 'output');
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import { run } from './src/index.mjs';
+      import assert from 'node:assert/strict';
+      import { writeFile } from 'node:fs/promises';
+      let sends = 0, reads = 0;
+      const logs = [];
+      const status = await run({
+        env: { INPUT_WEBHOOK: 'https://ci.invalid/hook', INPUT_OUTCOME: 'failure',
+          'INPUT_REDACT-ENV-FILE': process.env.REVIEW_ENV_PATH, 'INPUT_LOG-FILE': 'log' },
+        read: async () => { reads++; return 'RAW UNSAFE LOG'; },
+        post: async (_url, init) => { sends++; assert.ok(!init.body.includes('RAW UNSAFE LOG')); return { ok: true, json: async () => ({ code: 0 }) }; },
+        log: (line) => logs.push(line),
+      });
+      await writeFile(process.env.REVIEW_OUTPUT_PATH, JSON.stringify({ status, sends, reads, logs }));
+    `], { cwd: resolve(import.meta.dirname, '..'), env: { ...process.env, REVIEW_ENV_PATH: path, REVIEW_OUTPUT_PATH: output }, encoding: 'utf8', timeout: 3000 });
+    assert.equal(child.status, 0, child.error?.message || child.stderr);
+    const result = JSON.parse(await readFile(output, 'utf8'));
+    assert.equal(result.status, 'warning');
+    assert.equal(result.sends, 1);
+    assert.equal(result.reads, 0);
+    assert.ok(result.logs.includes(envFileWarning));
+    assert.ok(!result.logs.join('\n').includes(path));
+  }
+});
+
+test('review H-1: actual leading multiline suffixes match with controls without dropping safe records', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-suffix-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const secret = 'private-prefix\nprivate-middle\nprivate-suffix';
+  for (const tailPrefix of ['private-middle\nprivate-suffix', 'private-\u001b[31mmiddle\nprivate-\t\u0000suffix']) {
+    const record = tailPrefix + '\nERROR kept';
+    const tail = record + ' '.repeat(65536 - Buffer.byteLength(record));
+    await writeFile(join(dir, 'log'), 'x'.repeat(100000) + 'private-prefix\n' + tail);
+    const reason = await logTail(join(dir, 'log'), [secret]);
+    assert.ok(!reason.includes('private'), reason);
+    assert.match(reason, /ERROR kept/);
+  }
+});
+
+test('review L-2: env reader bounds reads, closes handles and detects size changes', async () => {
+  for (const [reportedSize, text, valid] of [[8, 'TOKEN=ok', true], [7, 'TOKEN=ok', false], [9, 'TOKEN=ok', false]]) {
+    let closed = false, bytesRead = 0;
+    const source = Buffer.from(text);
+    const read = readEnvFile('trusted.env', 'utf8', async () => ({
+      stat: async () => ({ size: reportedSize, isFile: () => true }),
+      read: async (buffer, offset, length, position) => {
+        // Simulate partial reads as well as concurrent growth/shrinkage.
+        const count = Math.min(2, length, Math.max(0, source.length - position));
+        source.copy(buffer, offset, position, position + count);
+        bytesRead += count;
+        return { bytesRead: count };
+      },
+      close: async () => { closed = true; },
+    }));
+    if (valid) assert.equal(await read, text);
+    else await assert.rejects(read);
+    assert.equal(closed, true);
+    assert.ok(bytesRead <= reportedSize + 1);
+  }
+});
+
+for (const [label, ending, overlap] of [
+  ['prefix', 'SECRET_token123', 'SECRET_t'],
+  ['middle', 'API_TOKEN_abc123', 'TOKEN_ab'],
+  ['JSON', '"token": "abc123def456"', 'token'],
+  ['multiline', 'PRIVATE-first\nPRIVATE-second-residual', 'PRIVATE-first\nPRIVATE-second'],
+]) {
+  test(`review N-1: ${label} overlap cannot hide a leading suffix from boundary matching`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'feishu-review-n1-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const secret = 'a'.repeat(70000) + '\n' + ending;
+    await writeFile(join(dir, 'log'), 'x'.repeat(200000) + '\n' + secret + '\nERROR safe');
+    const reason = await logTail(join(dir, 'log'), [secret, overlap]);
+    assert.equal(reason, '[已隐藏]\nERROR safe');
+    for (const fromFile of [false, true]) {
+      await writeFile(join(dir, '.env'), `MULTI='${secret}'\n${fromFile ? `PART='${overlap}'` : ''}`);
+      const result = await invoke({
+        GITHUB_WORKSPACE: dir, 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log',
+        'INPUT_REDACT-VALUES': fromFile ? '' : overlap,
+      });
+      assert.equal(result.status, 'sent');
+      // Explicit values are line-based; the multiline-overlap case therefore
+      // exercises two explicit lines here, and one intact value in the file.
+      assert.match(result.requests[0].payload.card.body.elements[1].content, /\n\[已隐藏\]\nERROR safe\n/);
+      assert.ok(!result.requests[0].body.includes('residual'));
+      assert.ok(!result.requests[0].body.includes('abc123'));
+      assert.ok(!result.requests[0].body.includes('oken123'));
+    }
+  });
+}
+
+test('review N-1: merge a leading suffix with a full value extending beyond it', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-n1-union-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const a = 'a'.repeat(70000) + '\nPRIVATE-middle';
+  const b = 'middle\nPRIVATE-extension';
+  await writeFile(join(dir, 'log'), 'x'.repeat(200000) + '\n' + a + '\nPRIVATE-extension\nERROR safe');
+  assert.equal(await logTail(join(dir, 'log'), [a, b]), '[已隐藏]\nERROR safe');
+});
+
+test('review N-2: near-limit multiline configuration avoids repeated suffix normalization', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-n2-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const secret = Array.from({ length: 16000 }, (_, i) => `row-${i}-${'k'.repeat(50)}`).join('\n');
+  assert.ok(Buffer.byteLength(secret) < 1024 * 1024);
+  await writeFile(join(dir, '.env'), `MULTI="${secret}"`);
+  await writeFile(join(dir, 'log'), 'safe progress\n'.repeat(20000) + 'ERROR safe');
+  const started = performance.now();
+  const result = await invoke({ GITHUB_WORKSPACE: dir, 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' });
+  const elapsed = performance.now() - started;
+  t.diagnostic(`near-limit 16000-line configuration: ${elapsed.toFixed(1)} ms`);
+  assert.equal(result.status, 'sent');
+  assert.match(result.requests[0].body, /ERROR safe/);
+  // Generous headroom for shared CI runners; the old implementation takes
+  // several seconds by repeatedly normalizing overlapping suffix strings.
+  assert.ok(elapsed < 2000, `configuration processing took ${elapsed.toFixed(1)} ms`);
+});
+
+test('review N-1: overlapping control-separated suffixes merge before replacement', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-n1-controls-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const secret = 'x'.repeat(70000) + '\nAPI_TOKEN_abc123';
+  await writeFile(join(dir, 'log'), 'prefix\n' + 'x'.repeat(70000) + '\nAPI_\u001b[31mTOKEN_\t\u0000abc123\nERROR safe');
+  assert.equal(await logTail(join(dir, 'log'), [secret, 'TOKEN_ab']), '[已隐藏]\nERROR safe');
+});
+
+test('review N-2: prefix failure links select the longest LF-aligned suffix', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-n2-borders-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  // The longest textual overlap is ababa, but only the shorter border aba
+  // starts immediately after LF. The remaining ba must stay visible.
+  const secret = 'x'.repeat(70000) + 'zzab\naba';
+  const record = 'ababa\nERROR safe';
+  const tail = record + ' '.repeat(65536 - Buffer.byteLength(record));
+  await writeFile(join(dir, 'log'), 'x'.repeat(200000) + 'zzab\n' + tail);
+  assert.equal(await logTail(join(dir, 'log'), [secret]), '[已隐藏]ba\nERROR safe');
+});
+
+for (const [label, filler] of [['NUL', '\u0000'], ['C1', '\u0085'], ['space control', ' ']]) {
+  test(`review N-3: ${label} tail expands to recover the real diagnostic`, async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), 'feishu-review-n3-'));
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const secret = 's'.repeat(70000) + '\nSECRET_TAIL';
+    await writeFile(join(dir, 'log'), 'x'.repeat(100000) + '\nERROR: real diagnostic\n' + filler.repeat(262140));
+    await writeFile(join(dir, '.env'), `MULTI="${secret}"`);
+    assert.equal(await logTail(join(dir, 'log'), [secret]), 'ERROR: real diagnostic');
+    const result = await invoke({ GITHUB_WORKSPACE: dir, 'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' });
+    assert.equal(result.status, 'sent');
+    assert.match(result.requests[0].body, /ERROR: real diagnostic/);
+    assert.ok(!result.requests[0].body.includes('未提供可用的检查日志'));
+  });
+}
+
+test('review N-4: large periodic complete matches stay bounded while preserving overlaps', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'feishu-review-n4-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  for (const pattern of ['A', 'ab']) {
+    const value = pattern.repeat(175000 / pattern.length);
+    await writeFile(join(dir, '.env'), `MULTI="${value}\n${value}"`);
+    await writeFile(join(dir, 'log'), 'x'.repeat(400000) + '\nERROR safe\n' + pattern.repeat(700000 / pattern.length) + '\n' + ' '.repeat(100000));
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      import assert from 'node:assert/strict';
+      import { run } from './src/index.mjs';
+      const started = performance.now();
+      const status = await run({
+        env: { INPUT_WEBHOOK: 'https://ci.invalid/hook', INPUT_OUTCOME: 'failure',
+          GITHUB_WORKSPACE: process.env.REVIEW_PERIODIC_WORKSPACE,
+          'INPUT_REDACT-ENV-FILE': '.env', 'INPUT_LOG-FILE': 'log' },
+        log: () => {},
+        post: async (_url, init) => {
+          const reason = JSON.parse(init.body).card.body.elements[1].content;
+          assert.ok(reason.includes('ERROR safe'));
+          assert.ok(!reason.includes('AAAA'));
+          assert.ok(!reason.includes('abab'));
+          return { ok: true, json: async () => ({ code: 0 }) };
+        },
+      });
+      assert.equal(status, 'sent');
+      console.log(JSON.stringify({ elapsed: performance.now() - started }));
+    `], {
+      cwd: resolve(import.meta.dirname, '..'), env: { ...process.env, REVIEW_PERIODIC_WORKSPACE: dir },
+      encoding: 'utf8', timeout: 5000,
+    });
+    assert.equal(child.status, 0, child.error?.message || child.stderr);
+    const { elapsed } = JSON.parse(child.stdout);
+    t.diagnostic(`periodic ${pattern} configuration: ${elapsed.toFixed(1)} ms`);
+    assert.ok(elapsed < 2000, `periodic match processing took ${elapsed.toFixed(1)} ms`);
+  }
 });
